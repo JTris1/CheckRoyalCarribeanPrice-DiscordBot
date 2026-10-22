@@ -1,12 +1,20 @@
 import os
+from datetime import datetime, timezone
+from pathlib import Path
+
 import discord
 from discord import app_commands
+from discord.ext import tasks
 import asyncpg
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 CHANNEL_ID = int(os.getenv("CHANNEL_ID") or 0)
 GUILD_ID = int(os.getenv("GUILD_ID") or 0)
+
+# New-all-time-low announcements (posted to CHANNEL_ID with @everyone)
+POLL_SECONDS = int(os.getenv("POLL_SECONDS") or 300)
+STATE_FILE = Path(os.getenv("STATE_FILE", "/data/last_seen.txt"))
 
 # Table or view to read; see cruise_prices_view.sql for a view that also includes the tracker's own history
 TABLE = os.getenv("PRICE_TABLE", "public.royal_carribean")
@@ -34,6 +42,10 @@ class Bot(discord.Client):
             await self.tree.sync(guild=guild)
         else:
             await self.tree.sync()
+        if CHANNEL_ID:
+            check_new_lows.start()
+        else:
+            print("CHANNEL_ID not set: new-all-time-low announcements are disabled")
 
 
 bot = Bot()
@@ -69,6 +81,83 @@ async def check_channel(interaction: discord.Interaction) -> bool:
         )
         return False
     return True
+
+
+# ---------- new all-time low announcements ----------
+# A row is a new low when its price is below every earlier price for the same
+# room type + cruise (cruise_description holds the sail date and ship). Only
+# rows newer than last_seen are examined, and last_seen is saved to STATE_FILE
+# so a restart neither re-announces old lows nor skips ones found while down.
+
+last_seen: datetime | None = None
+
+
+def load_last_seen() -> datetime | None:
+    try:
+        return datetime.fromisoformat(STATE_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def save_last_seen(dt: datetime) -> None:
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(dt.isoformat())
+    except OSError as e:
+        print(f"Could not save {STATE_FILE}: {e} (a restart may skip or repeat announcements)")
+
+
+@tasks.loop(seconds=POLL_SECONDS)
+async def check_new_lows():
+    global last_seen
+    try:
+        if last_seen is None:
+            last_seen = load_last_seen()
+        if last_seen is None:
+            # First ever run: start from the newest existing row so history isn't announced
+            last_seen = await bot.pool.fetchval(f"SELECT max(datetime) FROM {TABLE}") \
+                or datetime(1970, 1, 1, tzinfo=timezone.utc)
+            save_last_seen(last_seen)
+            return
+
+        rows = await bot.pool.fetch(
+            f"""SELECT * FROM (
+                    SELECT room_type, cruise_description, price, datetime,
+                           min(price) OVER (
+                               PARTITION BY room_type, cruise_description
+                               ORDER BY datetime, price
+                               ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                           ) AS prev_min
+                    FROM {TABLE}
+                ) t
+                WHERE datetime > $1
+                ORDER BY datetime""",
+            last_seen,
+        )
+        if not rows:
+            return
+        channel = bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
+        for r in rows:
+            if r["prev_min"] is not None and r["price"] < r["prev_min"]:
+                await channel.send(
+                    content=(
+                        f"@everyone 🟢 **New all-time low!**\n"
+                        f"**{money(r['price'])}** — {r['room_type']} · {r['cruise_description']}\n"
+                        f"Previous low {money(r['prev_min'])} "
+                        f"(-{money(r['prev_min'] - r['price'])}) · {ts(r['datetime'])}"
+                    ),
+                    allowed_mentions=discord.AllowedMentions(everyone=True),
+                )
+            # advance per row so a failed send is retried without repeating earlier ones
+            last_seen = r["datetime"]
+            save_last_seen(last_seen)
+    except Exception as e:  # keep the loop alive across DB/Discord hiccups
+        print(f"new-low check failed: {type(e).__name__}: {e}")
+
+
+@check_new_lows.before_loop
+async def _before_check_new_lows():
+    await bot.wait_until_ready()
 
 
 async def room_autocomplete(interaction: discord.Interaction, current: str):
